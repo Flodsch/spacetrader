@@ -37,6 +37,11 @@ def request(url, type, body=None):
     return json.loads(x.text)
 
 if __name__ == "__main__":
+    ships = request("https://api.spacetraders.io/v2/my/ships", Request.GET)
+    for page in range(2, math.ceil(ships["meta"]["total"] / ships["meta"]["limit"]) + 1):
+        [ships["data"].append(ship) for ship in request("https://api.spacetraders.io/v2/my/ships?page={}".format(page), Request.GET)["data"]]
+    for ship in ships["data"]:
+        pass # log.info(ship["symbol"])
     try:
         while True:
             time.sleep(1)
