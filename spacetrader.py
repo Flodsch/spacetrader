@@ -39,6 +39,11 @@ def request(url, type, body=None):
     return json.loads(x.text)
 
 if __name__ == "__main__":
+    agent = request("https://api.spacetraders.io/v2/my/agent", Request.GET)
+    hq_system = "-".join((agent["data"]["headquarters"].split("-")[0], agent["data"]["headquarters"].split("-")[1]))
+    waypoints = request("https://api.spacetraders.io/v2/systems/{}/waypoints".format(hq_system), Request.GET)
+    for page in range(2, math.ceil(waypoints["meta"]["total"] / waypoints["meta"]["limit"]) + 1):
+        [waypoints["data"].append(waypoint) for waypoint in request("https://api.spacetraders.io/v2/systems/{}/waypoints?page={}".format(hq_system, page), Request.GET)["data"]]
     ships = request("https://api.spacetraders.io/v2/my/ships", Request.GET)
     for page in range(2, math.ceil(ships["meta"]["total"] / ships["meta"]["limit"]) + 1):
         [ships["data"].append(ship) for ship in request("https://api.spacetraders.io/v2/my/ships?page={}".format(page), Request.GET)["data"]]
