@@ -262,6 +262,30 @@ def upgrader_i(ship_symbol, shipyard_symbol="X1-YA22-18767C", asteroid_field_sym
             seconds_to_arrival = round((parser.parse(x["data"]["nav"]["route"]["arrival"]).replace(tzinfo=None) - datetime.datetime.utcnow().replace(tzinfo=None)).total_seconds())
             time.sleep(seconds_to_arrival)
 
+def surveyor_i(ship_symbol):
+    def _survey():
+        x = request("https://api.spacetraders.io/v2/my/ships/{}/survey".format(ship_symbol), Request.POST)
+        try:
+            x["data"]
+        except KeyError:
+            try:
+                x["error"]
+            except:
+                log.error("[{}] {}".format(ship_symbol, x))
+            else:
+                if x["error"]["code"] == 4000: # Ship action is still on cooldown
+                    cooldown_seconds = x["error"]["data"]["cooldown"]["remainingSeconds"]
+                    log.info("[{}] Ship is still cooling down for {} seconds.".format(ship_symbol, cooldown_seconds))
+                    time.sleep(cooldown_seconds)
+                    _survey()
+        else:
+            for survey in x["data"]["surveys"]:
+                log.info("[{}] Successfully surveyed. Adding {}.".format(ship_symbol, survey["signature"]))
+                save_survey(survey)
+            return x
+    _survey()
+    surveyor_i(ship_symbol)
+    
 if __name__ == "__main__":
     agent = request("https://api.spacetraders.io/v2/my/agent", Request.GET)
     log.info("Starting... {}".format(agent))
@@ -278,14 +302,17 @@ if __name__ == "__main__":
     for waypoint in waypoints["data"]:
         if waypoint["type"] == 'ASTEROID_FIELD':
             asteroid_field_symbol = waypoint["symbol"]
-    threading.Thread(target=buyer_i, args=(shipyard_symbol, asteroid_field_symbol, ), daemon=True).start()
+    # threading.Thread(target=buyer_i, args=(shipyard_symbol, asteroid_field_symbol, ), daemon=True).start()
     threading.Thread(target=rater_i, args=(system_symbol, asteroid_field_symbol, ), daemon=True).start()
     ships = request("https://api.spacetraders.io/v2/my/ships", Request.GET)
     for page in range(2, math.ceil(ships["meta"]["total"] / ships["meta"]["limit"]) + 1):
         [ships["data"].append(ship) for ship in request("https://api.spacetraders.io/v2/my/ships?page={}".format(page), Request.GET)["data"]]
     for ship in ships["data"]:
-        if ship["symbol"] != "FLODSCH-2":
-            threading.Thread(target=miner_ii, args=(ship["symbol"], ), daemon=True).start()
+        if ship["symbol"] == "FLODSCH-1":
+            threading.Thread(target=surveyor_i, args=(ship["symbol"], ), daemon=True).start()
+        else:
+            if ship["symbol"] != "FLODSCH-2":
+                threading.Thread(target=miner_ii, args=(ship["symbol"], ), daemon=True).start()
     try:
         while True:
             time.sleep(1)
