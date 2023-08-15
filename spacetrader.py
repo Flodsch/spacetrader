@@ -2,16 +2,18 @@ import math
 import time
 import json
 import enum
+import numpy
 import sqlite3
 import logging
 import requests
 import datetime
 import threading
 import collections
+import jmespath as jp
 from dateutil import parser
 
 handler = logging.StreamHandler()
-handler.setFormatter(logging.Formatter("%(asctime)s [%(threadName)-20.20s] [%(levelname)-5.5s] %(message)s"))
+handler.setFormatter(logging.Formatter("%(asctime)s [%(threadName)-9.9s] [%(levelname)-5.5s] %(message)s"))
 log = logging.getLogger('spacetrader')
 log.addHandler(handler)
 log.setLevel(logging.INFO)
@@ -20,6 +22,7 @@ class Request(enum.Enum):
     GET = 1
     POST = 2
 
+agent_symbol = None
 with open('token', 'r') as f:
     token = f.read()
 
@@ -36,285 +39,247 @@ def request(url, type, body=None):
                 x = requests.post(url, headers=http_headers, data=json.dumps(body))
             else:
                 x = requests.post(url, headers=http_headers)
-        log.debug("[{}] {} {} {}".format(type, x.request.url, x.request.headers, x.request.body))
         if x.status_code == 429:
-            time.sleep(float(json.loads(x.text)["error"]["data"]["retryAfter"]))
+            retry_after = float(jp.search('error.data.retryAfter', json.loads(x.text)))
+            log.debug("429 http status code. Need to wait {} seconds.".format(retry_after))
+            time.sleep(retry_after)
         else:
             break
     http_semaphore.release()
+    log.debug("[{}] {} {} {}".format(type, x.request.url, x.request.headers, x.request.body))
     log.debug(x.text)
     return json.loads(x.text)
 
-def query(sql_string):
-    con = sqlite3.connect("survey.db")
-    cur = con.cursor()
-    res = cur.execute(sql_string).fetchall()
-    cur.close()
-    con.close()
-    return res
+class ShipException(Exception):
+    pass
 
-def save_survey(survey):
-    con = sqlite3.connect("survey.db")
-    cur = con.cursor()
-    cur.execute('INSERT INTO surveys(survey, rating) VALUES(\'{}\', {})'.format(json.dumps(survey), 40))
-    con.commit()
-    cur.close()
-    con.close()
+class Ship:
+    def __init__(self, symbol) -> None:
+        self.symbol = symbol
+        req = request("https://api.spacetraders.io/v2/my/ships/{}".format(self.symbol), Request.GET)
+        data = jp.search('data', req)
+        if data:
+            for k, v in data.items():
+                setattr(self, k, v)
+        log.info("[{}] Ship is online.".format(self.symbol))
 
-def read_survey():
-    con = sqlite3.connect("survey.db")
-    cur = con.cursor()
-    res = cur.execute("SELECT * FROM surveys ORDER BY rating DESC LIMIT 1;")
-    x = res.fetchone()
-    return json.loads(x[1])
+    def dock(self):
+        req = request("https://api.spacetraders.io/v2/my/ships/{}/dock".format(self.symbol), Request.POST)
+        if jp.search('data', req):
+            self.nav = jp.search('data', req)["nav"]
+            log.info("[{}] Docking successful.".format(self.symbol))
+            return req
+        if jp.search('error', req):
+            raise ShipException(jp.search('error', req))
 
-"""
-survey/extract/sell at asteroid using own survey
-"""
-def miner_ii(ship_symbol):
-    
-    def _survey():
-        x = request("https://api.spacetraders.io/v2/my/ships/{}/survey".format(ship_symbol), Request.POST)
+    def orbit(self):
+        req = request("https://api.spacetraders.io/v2/my/ships/{}/orbit".format(self.symbol), Request.POST)
+        if jp.search('data', req):
+            self.nav = jp.search('data', req)["nav"]
+            log.info("[{}] Orbiting successful.".format(self.symbol))
+            return req
+        if jp.search('error', req):
+            raise ShipException(jp.search('error', req))
+
+    def sell(self, item):
+        req = request("https://api.spacetraders.io/v2/my/ships/{}/sell".format(self.symbol), Request.POST, {"symbol": item["symbol"], "units": item["units"]})
+        if jp.search('data', req):
+            self.cargo = jp.search('data.cargo', req)
+            log.info("[{}] Selling successful: {} x {} @ {} cr.".format(self.symbol, item["units"], item["symbol"], jp.search("data.transaction.totalPrice", req)))
+            return req
+        if jp.search('error', req):
+            raise ShipException(jp.search('error', req))
+
+    def survey(self):
+        req = request("https://api.spacetraders.io/v2/my/ships/{}/survey".format(self.symbol), Request.POST)
+        if jp.search('data', req):
+            for survey in jp.search('data.surveys', req):
+                log.info("[{}] Surveyed: {}.".format(self.symbol, survey["signature"]))
+            return req
+        if jp.search('error', req):
+            raise ShipException(jp.search('error', req))
+
+    def extract(self, survey=None):
+        req = request("https://api.spacetraders.io/v2/my/ships/{}/extract".format(self.symbol), Request.POST, body = {"survey": survey}) if survey else request("https://api.spacetraders.io/v2/my/ships/{}/extract".format(self.symbol), Request.POST)
+        if jp.search('data', req):
+            self.cargo = jp.search('data.cargo', req)
+            log.info("[{}] Extracting successful: {} x {}. Using {}.".format(self.symbol, jp.search("data.extraction.yield", req)["units"], jp.search("data.extraction.yield", req)["symbol"], survey["signature"]))
+            return req
+        if jp.search('error', req):
+            raise ShipException(jp.search('error', req))
+
+def _sell(ship):
+    ship.dock()
+    for item in ship.cargo["inventory"]:
+        ship.sell(item)   
+    ship.orbit()
+
+def surveyor_i(ship):
+    try:
+        req = ship.survey()
+    except ShipException as e:
+        match e.args[0]["code"]:
+            case 4000: # cooldownConflictError
+                remaining_seconds = jp.search('data.cooldown.remainingSeconds', e.args[0])
+                log.info("[{}] Erroneous survey cooldown: {} seconds.".format(ship.symbol, remaining_seconds))
+                time.sleep(remaining_seconds)
+    except Exception as e:
+        pass
+    else:
+        with sqlite3.connect("{}.db".format(agent_symbol)) as conn:
+            for survey in req["data"]["surveys"]:
+                conn.execute('INSERT INTO surveys(survey, rating, signature, deposits, expiration, size) VALUES(\'{}\', {}, \'{}\', \'{}\', \'{}\', \'{}\');'.format(json.dumps(survey), 2, survey["signature"], json.dumps(survey["deposits"]), survey["expiration"], survey["size"]))
+        remaining_seconds = int((parser.parse(jp.search('data.cooldown.expiration', req)).replace(tzinfo=None) - datetime.datetime.utcnow()).total_seconds())
+        log.info("[{}] Normal survey cooldown: {} seconds.".format(ship.symbol, remaining_seconds))
+        time.sleep(remaining_seconds)
+
+def miner_i(ship):
+    if ship.nav["status"] == "DOCKED":
+        ship.orbit()
+    if len(ship.cargo["inventory"]) > 0:
+        _sell(ship)
+    with sqlite3.connect("{}.db".format(agent_symbol)) as conn:
+        survey = conn.execute("SELECT * FROM surveys ORDER BY rating DESC LIMIT 1;").fetchone()
+    if survey:
         try:
-            x["data"]
-        except KeyError:
-            try:
-                x["error"]
-            except:
-                log.error("[{}] {}".format(ship_symbol, x))
-            else:
-                if x["error"]["code"] == 4000: # Ship action is still on cooldown
-                    cooldown_seconds = x["error"]["data"]["cooldown"]["remainingSeconds"]
-                    log.info("[{}] Ship is still cooling down for {} seconds.".format(ship_symbol, cooldown_seconds))
-                    time.sleep(cooldown_seconds)
-                    _survey()
+            req = ship.extract(json.loads(survey[2]))
+        except ShipException as e:
+            match e.args[0]["code"]:
+                case 4000: # cooldownConflictError
+                    remaining_seconds = jp.search('data.cooldown.remainingSeconds', e.args[0])
+                    log.info("[{}] Erroneous extract cooldown: {} seconds.".format(ship.symbol, remaining_seconds))
+                    time.sleep(remaining_seconds)
+                case 4221: # shipSurveyExpirationError 
+                    log.info("[{}] Survey expired. Deleting {}.".format(ship.symbol, survey[3]))
+                    with sqlite3.connect("{}.db".format(agent_symbol)) as conn:
+                        conn.execute("DELETE FROM surveys WHERE signature = '{}';".format(survey[3]))
+                case 4224: # shipSurveyExhaustedError
+                    log.info("[{}] Survey exhausted. Deleting {}.".format(ship.symbol, survey[3]))
+                    with sqlite3.connect("{}.db".format(agent_symbol)) as conn:
+                        conn.execute("DELETE FROM surveys WHERE signature = '{}';".format(survey[3]))
+        except Exception as e:
+            log.error(e)
         else:
-            for survey in x["data"]["surveys"]:
-                log.info("[{}] Successfully surveyed. Adding {}.".format(ship_symbol, survey["signature"]))
-                save_survey(survey)
-            return x
+            _sell(ship)
+            remaining_seconds = int((parser.parse(jp.search('data.cooldown.expiration', req)).replace(tzinfo=None) - datetime.datetime.utcnow()).total_seconds())
+            log.info("[{}] Normal extract cooldown: {} seconds.".format(ship.symbol, remaining_seconds))
+            time.sleep(remaining_seconds)
+    else:
+        surveyor_i(ship) # survey one round
 
-    def _extract():
-        while True:
-            survey = read_survey()
-            x = request("https://api.spacetraders.io/v2/my/ships/{}/extract".format(ship_symbol), Request.POST, body = {"survey": survey})
-            try:
-                x["data"]
-            except KeyError:
-                try:
-                    x["error"]
-                except:
-                    log.error("[{}] {}".format(ship_symbol, x))
-                else:
-                    if x["error"]["code"] == 4228: # Ship is at maximum capacity
-                        log.info("[{}] Ship is at maximum capacity.".format(ship_symbol))
-                        return
-                    if x["error"]["code"] == 4000: # Ship action is still on cooldown
-                        cooldown_seconds = x["error"]["data"]["cooldown"]["remainingSeconds"]
-                        log.info("[{}] Ship is still cooling down for {} seconds.".format(ship_symbol, cooldown_seconds))
-                        time.sleep(cooldown_seconds)
-                    if x["error"]["code"] in [4221, 4224]: # shipSurveyExpirationError || shipSurveyExhaustedError
-                        log.info("[{}] Survey expired or exhausted. Deleting {}.".format(ship_symbol, survey["signature"]))
-                        con = sqlite3.connect("survey.db")
-                        cur = con.cursor()
-                        cur.execute("DELETE FROM surveys WHERE survey = \'{}\';".format(json.dumps(survey)))
-                        con.commit()
-            else:
-                log.info("[{}] {}".format(ship_symbol, "Extracting successful: {} x {}.".format(x["data"]["extraction"]["yield"]["units"], x["data"]["extraction"]["yield"]["symbol"])))
-                load = int((x["data"]["cargo"]["units"] / x["data"]["cargo"]["capacity"]) * 100)
-                if load > 80:
-                    log.info("[{}] capacity at: {}%".format(ship_symbol, load))
-                    return
-                else:
-                    cooldown_seconds = x["data"]["cooldown"]["remainingSeconds"]
-                    time.sleep(cooldown_seconds)
+def standby_i(ship_symbol):
+    time.sleep(10)
 
-    def _sell():
-        request("https://api.spacetraders.io/v2/my/ships/{}/dock".format(ship_symbol), Request.POST)
-        for item in request("https://api.spacetraders.io/v2/my/ships/{}/cargo".format(ship_symbol), Request.GET)["data"]["inventory"]:
-            x = request("https://api.spacetraders.io/v2/my/ships/{}/sell".format(ship_symbol), Request.POST, {"symbol": item["symbol"], "units": item["units"]})
-            try:
-                x["data"]
-            except KeyError:
-                log.error("[{}] {}".format(ship_symbol, x))
-            else:
-                log.info("[{}] {}".format(ship_symbol, "Selling successful: {} x {} @ {} cr.".format(item["units"], item["symbol"], x["data"]["transaction"]["totalPrice"])))
-    
-    request("https://api.spacetraders.io/v2/my/ships/{}/orbit".format(ship_symbol), Request.POST)
-    if int(query("SELECT COUNT(*) FROM surveys")[0][0]) < 10:
-        _survey()
-    _extract()
-    _sell()
-    upgrader_i(ship_symbol)
-    miner_ii(ship_symbol)
-
-"""
-extract/sell at asteroid
-"""
-def miner_i(ship_symbol):
-    request("https://api.spacetraders.io/v2/my/ships/{}/orbit".format(ship_symbol), Request.POST) 
+def function_switchboard(ship):
     while True:
-        x = request("https://api.spacetraders.io/v2/my/ships/{}/extract".format(ship_symbol), Request.POST)
-        try:
-            x["data"]
-        except KeyError:
+        with sqlite3.connect("{}.db".format(agent_symbol)) as conn:
+            function_name = conn.execute("SELECT function_name FROM ships WHERE ship_symbol = '{}';".format(ship.symbol)).fetchone()[0]
             try:
-                x["error"]
-            except:
-                pass
-            else:
-                if x["error"]["code"] == 4228: # Ship is at maximum capacity
-                    log.info("[{}] Ship is at maximum capacity.".format(ship_symbol))
-                    break
-                if x["error"]["code"] == 4000: # Ship action is still on cooldown
-                    cooldown_seconds = x["error"]["data"]["cooldown"]["remainingSeconds"]
-                    log.info("[{}] Ship is still cooling down for {} seconds.".format(ship_symbol, cooldown_seconds))
-                    time.sleep(cooldown_seconds)
-        else:
-            log.info("[{}] {}".format(ship_symbol, "Extracting successful: {} x {}.".format(x["data"]["extraction"]["yield"]["units"], x["data"]["extraction"]["yield"]["symbol"])))
-            load = int((x["data"]["cargo"]["units"] / x["data"]["cargo"]["capacity"]) * 100)
-            if load > 80:
-                log.info("[{}] capacity at: {}%".format(ship_symbol, load))
-                break
-            else:
-                cooldown_seconds = x["data"]["cooldown"]["remainingSeconds"]
-                time.sleep(cooldown_seconds)
-    request("https://api.spacetraders.io/v2/my/ships/{}/dock".format(ship_symbol), Request.POST)
-    for item in request("https://api.spacetraders.io/v2/my/ships/{}/cargo".format(ship_symbol), Request.GET)["data"]["inventory"]:
-        z = request("https://api.spacetraders.io/v2/my/ships/{}/sell".format(ship_symbol), Request.POST, {"symbol": item["symbol"], "units": item["units"]})
-        try:
-            z["data"]
-        except KeyError:
-            log.error("[{}] {}".format(ship_symbol, z))
-        else:
-            log.info("[{}] {}".format(ship_symbol, "Selling successful: {} x {} @ {} cr.".format(item["units"], item["symbol"], z["data"]["transaction"]["totalPrice"])))
-    miner_i(ship_symbol)
-
-"""
-auto buy ships
-"""
-def buyer_i(shipyard_symbol, asteroid_field_symbol):
-    while True:
-        ships = request("https://api.spacetraders.io/v2/my/ships", Request.GET)
-        if ships["meta"]["total"] < 100:
-            x = request('https://api.spacetraders.io/v2/my/ships', Request.POST, body={"shipType": "SHIP_ORE_HOUND", "waypointSymbol": shipyard_symbol})
-            try:
-                x["data"]
+                func = globals()[function_name]
             except KeyError:
-                if x["error"]["code"] == 4216: # insufficient funds
-                    log.info("Insufficient funds: {}".format(x["error"]["data"]))
-                else:
-                    log.error(x)
+                log.error("Please correct column function_name for '{}'. '{}' does not match a valid function signature.".format(ship.symbol, function_name))
             else:
-                ship = x["data"]["ship"]["symbol"]
-                log.info("[{}] Welcome to the fleet.".format(ship))
-                request("https://api.spacetraders.io/v2/my/ships/{}/orbit".format(ship), Request.POST)
-                b = request("https://api.spacetraders.io/v2/my/ships/{}/navigate".format(ship), Request.POST, body={"waypointSymbol": asteroid_field_symbol})
-                time.sleep(300)
-                threading.Thread(target=miner_ii, args=(ship,), daemon=True).start()
-        time.sleep(900)
+                func(ship)
 
-def rater_i(system_symbol, asteroid_field_symbol):
-    
+def rater_i():
+    while True:
+        with sqlite3.connect("{}.db".format(agent_symbol)) as conn:
+            asteroid_field_symbol = conn.execute("SELECT symbol FROM waypoints WHERE type = 'ASTEROID_FIELD';").fetchone()[0]
+            system_symbol = "{}-{}".format(asteroid_field_symbol.split("-")[0], asteroid_field_symbol.split("-")[1])
+            market_data = request("https://api.spacetraders.io/v2/systems/{}/waypoints/{}/market".format(system_symbol, asteroid_field_symbol), Request.GET)["data"]["tradeGoods"]
+            for page in range(2, math.ceil(market_data["meta"]["total"] / market_data["meta"]["limit"]) + 1):
+                [market_data["data"].append(ship) for ship in request("https://api.spacetraders.io/v2/systems/{}/waypoints/{}/market?page={}".format(system_symbol, asteroid_field_symbol, page), Request.GET)["data"]]
+            goods_to_delete = []
+            for good in market_data:
+                if good["sellPrice"] < 10:
+                    goods_to_delete.append("deposits LIKE '%{}%'".format(good["symbol"]))
+            conn.execute('''
+                DELETE FROM surveys
+                WHERE {} 
+                OR expiration <= time('now');
+            '''.format(" OR ".join(goods_to_delete)))
+            log.info("Purged surveys!")
+        time.sleep(60)
+
+def rater_ii():
+
     def _score(survey, market):
         counter = collections.Counter([x["symbol"] for x in survey["deposits"]])
-        total = 0
+        arr1 = []
+        arr2 = []
         for key, value in counter.items():
-            total += value * [x for x in market if x["symbol"] == key][0]["sellPrice"]
-        # return int(total / len(counter))
-        return int(total)
-
-    market_data = request("https://api.spacetraders.io/v2/systems/{}/waypoints/{}/market".format(system_symbol, asteroid_field_symbol), Request.GET)["data"]["tradeGoods"]
-    con = sqlite3.connect("survey.db")
-    cur = con.cursor()
-    res = cur.execute("SELECT * FROM surveys")
-    # log.info("Survey pool size: {}".format(len(res.fetchall())))
-    for survey in res.fetchall():
-        data = json.loads(survey[1])
-        remainder = int((parser.parse(data["expiration"]).replace(tzinfo=None) - datetime.datetime.now()).total_seconds())
-        if remainder < 300:
-            cur.execute("DELETE FROM surveys WHERE number = {};".format(survey[0]))
-        else:
-            score = _score(data, market_data)
-            cur.execute("UPDATE surveys SET rating = {} WHERE number = {}".format(score, survey[0]))
-    cur.execute("DELETE FROM surveys WHERE number NOT IN (SELECT number FROM surveys ORDER BY rating DESC LIMIT 10);")
-    con.commit()
-    time.sleep(60)
-    rater_i(system_symbol, asteroid_field_symbol)
-
-def upgrader_i(ship_symbol, shipyard_symbol="X1-YA22-18767C", asteroid_field_symbol="X1-YA22-87615D"):
-    x = request("https://api.spacetraders.io/v2/my/ships/{}".format(ship_symbol), Request.GET)
-    if x["data"]["frame"]["symbol"] == "FRAME_MINER" and len(x["data"]["mounts"]) == 2: # if free mount:
-        agent = request("https://api.spacetraders.io/v2/my/agent", Request.GET)
-        market_data = request("https://api.spacetraders.io/v2/systems/{}/waypoints/{}/market".format("X1-YA22", shipyard_symbol), Request.GET)["data"]["tradeGoods"]
-        laser_price = [x for x in market_data if x["symbol"] == "MOUNT_MINING_LASER_II"][0]["purchasePrice"]
-        if agent["data"]["credits"] > laser_price + 5000: # consider installation fees
-            log.info("[{}] Going to upgrade: {}.".format(ship_symbol, "MOUNT_MINING_LASER_II"))
-            request("https://api.spacetraders.io/v2/my/ships/{}/orbit".format(ship_symbol), Request.POST)
-            x = request("https://api.spacetraders.io/v2/my/ships/{}/navigate".format(ship_symbol), Request.POST, {"waypointSymbol": shipyard_symbol})
-            seconds_to_arrival = round((parser.parse(x["data"]["nav"]["route"]["arrival"]).replace(tzinfo=None) - datetime.datetime.utcnow().replace(tzinfo=None)).total_seconds())
-            time.sleep(seconds_to_arrival)
-            request("https://api.spacetraders.io/v2/my/ships/{}/dock".format(ship_symbol), Request.POST)
-            request('https://api.spacetraders.io/v2/my/ships/{}/purchase'.format(ship_symbol), Request.POST, body={"symbol": "MOUNT_MINING_LASER_II", "units": 1})
-            request('https://api.spacetraders.io/v2/my/ships/{}/mounts/install'.format(ship_symbol), Request.POST, body={"symbol": "MOUNT_MINING_LASER_II",})
-            request("https://api.spacetraders.io/v2/my/ships/{}/orbit".format(ship_symbol), Request.POST)
-            x = request("https://api.spacetraders.io/v2/my/ships/{}/navigate".format(ship_symbol), Request.POST, {"waypointSymbol": asteroid_field_symbol})
-            seconds_to_arrival = round((parser.parse(x["data"]["nav"]["route"]["arrival"]).replace(tzinfo=None) - datetime.datetime.utcnow().replace(tzinfo=None)).total_seconds())
-            time.sleep(seconds_to_arrival)
-
-def surveyor_i(ship_symbol):
-    def _survey():
-        x = request("https://api.spacetraders.io/v2/my/ships/{}/survey".format(ship_symbol), Request.POST)
-        try:
-            x["data"]
-        except KeyError:
-            try:
-                x["error"]
-            except:
-                log.error("[{}] {}".format(ship_symbol, x))
-            else:
-                if x["error"]["code"] == 4000: # Ship action is still on cooldown
-                    cooldown_seconds = x["error"]["data"]["cooldown"]["remainingSeconds"]
-                    log.info("[{}] Ship is still cooling down for {} seconds.".format(ship_symbol, cooldown_seconds))
-                    time.sleep(cooldown_seconds)
-                    _survey()
-        else:
-            for survey in x["data"]["surveys"]:
-                log.info("[{}] Successfully surveyed. Adding {}.".format(ship_symbol, survey["signature"]))
-                save_survey(survey)
-            return x
-    _survey()
-    surveyor_i(ship_symbol)
+            arr1.append(value)
+            arr2.append([x for x in market if x["symbol"] == key][0]["sellPrice"])
+        return numpy.dot(arr1, arr2) # return numpy.sum(numpy.divide(arr1, arr2))
     
-if __name__ == "__main__":
+    while True:
+        with sqlite3.connect("{}.db".format(agent_symbol)) as conn:
+            asteroid_field_symbol = "X1-YA22-87615D"
+            system_symbol = "{}-{}".format(asteroid_field_symbol.split("-")[0], asteroid_field_symbol.split("-")[1])
+            market_data = request("https://api.spacetraders.io/v2/systems/{}/waypoints/{}/market".format(system_symbol, asteroid_field_symbol), Request.GET)
+            for survey in conn.execute("SELECT * FROM surveys;"):
+                conn.execute("UPDATE surveys SET rating = {} WHERE signature = '{}';".format(_score(json.loads(survey[2]), market_data["data"]["tradeGoods"]), survey[3]))
+                conn.execute("DELETE FROM surveys WHERE expiration <= time('now');")
+                conn.execute("DELETE FROM surveys WHERE number NOT IN (SELECT number FROM surveys ORDER BY rating DESC LIMIT 20);")
+            log.info("[rater_ii] Rated and purged surveys!")
+        time.sleep(60)
+
+def main():
+    global agent_symbol
     agent = request("https://api.spacetraders.io/v2/my/agent", Request.GET)
     log.info("Starting... {}".format(agent))
-    system_symbol = "-".join((agent["data"]["headquarters"].split("-")[0], agent["data"]["headquarters"].split("-")[1]))
-    waypoints = request("https://api.spacetraders.io/v2/systems/{}/waypoints".format(system_symbol), Request.GET)
+    agent_symbol = jp.search('data.symbol', agent)
+    hq_system = "-".join((jp.search('data.headquarters', agent).split("-")[0], jp.search('data.headquarters', agent).split("-")[1]))
+    waypoints = request("https://api.spacetraders.io/v2/systems/{}/waypoints".format(hq_system), Request.GET)
     for page in range(2, math.ceil(waypoints["meta"]["total"] / waypoints["meta"]["limit"]) + 1):
-        [waypoints["data"].append(waypoint) for waypoint in request("https://api.spacetraders.io/v2/systems/{}/waypoints?page={}".format(system_symbol, page), Request.GET)["data"]]
-    shipyard_symbol = None
-    for waypoint in waypoints["data"]:
-        for trait in waypoint["traits"]:
-            if trait["symbol"] == "SHIPYARD":
-                shipyard_symbol = waypoint["symbol"]
-    asteroid_field_symbol = None
-    for waypoint in waypoints["data"]:
-        if waypoint["type"] == 'ASTEROID_FIELD':
-            asteroid_field_symbol = waypoint["symbol"]
-    # threading.Thread(target=buyer_i, args=(shipyard_symbol, asteroid_field_symbol, ), daemon=True).start()
-    threading.Thread(target=rater_i, args=(system_symbol, asteroid_field_symbol, ), daemon=True).start()
+        [waypoints["data"].append(waypoint) for waypoint in request("https://api.spacetraders.io/v2/systems/{}/waypoints?page={}".format(hq_system, page), Request.GET)["data"]]
     ships = request("https://api.spacetraders.io/v2/my/ships", Request.GET)
     for page in range(2, math.ceil(ships["meta"]["total"] / ships["meta"]["limit"]) + 1):
         [ships["data"].append(ship) for ship in request("https://api.spacetraders.io/v2/my/ships?page={}".format(page), Request.GET)["data"]]
+    with sqlite3.connect("{}.db".format(agent_symbol)) as conn:
+        conn.execute('''
+            CREATE TABLE IF NOT EXISTS "waypoints" (
+                "symbol"	TEXT,
+                "type"	TEXT,
+                "x"	INTEGER,
+                "y"	INTEGER,
+                "shipyard"	TEXT,
+                PRIMARY KEY("symbol")
+            )
+        ''')
+        conn.execute('''
+            CREATE TABLE IF NOT EXISTS "surveys" (
+                "number"	INTEGER,
+                "rating"	INTEGER,
+                "survey"	TEXT NOT NULL,
+                "signature"	TEXT,
+                "deposits"	TEXT,
+                "expiration"	TEXT,
+                "size"	TEXT,
+                PRIMARY KEY("number" AUTOINCREMENT)
+            )
+        ''')
+        conn.execute('''
+            CREATE TABLE IF NOT EXISTS "ships" (
+                "ship_symbol"	,
+                "function_name"	,
+                PRIMARY KEY("ship_symbol")
+            )
+        ''')
+        for ship in ships["data"]:
+            conn.execute("INSERT OR IGNORE INTO ships VALUES('{}', 'standby_i')".format(ship["symbol"]))
+        for waypoint in waypoints["data"]:
+            conn.execute("INSERT OR IGNORE into waypoints(symbol, type, x, y, shipyard) VALUES('{}', '{}', {}, {}, {});".format(waypoint["symbol"], waypoint["type"], waypoint["x"], waypoint["y"], "SHIPYARD" in str(waypoint["traits"])))
     for ship in ships["data"]:
-        if ship["symbol"] == "FLODSCH-1":
-            threading.Thread(target=surveyor_i, args=(ship["symbol"], ), daemon=True).start()
-        else:
-            if ship["symbol"] != "FLODSCH-2":
-                threading.Thread(target=miner_ii, args=(ship["symbol"], ), daemon=True).start()
+        threading.Thread(target=function_switchboard, args=(Ship(ship["symbol"]), ), daemon=True).start()
+    threading.Thread(target=rater_ii, daemon=True).start()
     try:
         while True:
             time.sleep(1)
     except KeyboardInterrupt:
-        pass
+        log.info("Shutting down!")
+        with sqlite3.connect("{}.db".format(agent_symbol)) as conn:
+            conn.execute("DELETE FROM ships;")
+
+if __name__ == "__main__":
+    main()
